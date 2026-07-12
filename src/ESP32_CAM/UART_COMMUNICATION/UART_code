@@ -1,0 +1,299 @@
+"""
+CamLink.py
+----------
+UART communication driver for the CamModule (ESP32-CAM), talking to the
+MainController (ESP32) over a hardware UART link.
+
+This file and MainController/src/Comms/UARTLink.py implement the SAME
+framing protocol. If you change one, change the other to match.
+
+Frame format (all multi-byte fields little-endian):
+
+    [SOF 1B=0xAA][MSG_TYPE 1B][LEN 2B][PAYLOAD LEN bytes][CHK 1B][EOF 1B=0x55]
+
+    CHK = XOR of the MSG_TYPE byte, both LEN bytes, and every payload byte.
+
+Max payload per frame is MAX_PAYLOAD bytes. CamLink additionally provides
+send_image()/receive_image() helpers that split/reassemble a JPEG buffer
+across IMAGE_START / IMAGE_CHUNK* / IMAGE_END frames.
+"""
+
+from machine import UART
+import time
+
+# ---- Protocol constants (must match UARTLink.py exactly) ----
+SOF = 0xAA
+EOF = 0x55
+MAX_PAYLOAD = 512
+HEADER_LEN = 4   # SOF + MSG_TYPE + LEN(2)
+FOOTER_LEN = 2   # CHK + EOF
+IMAGE_CHUNK_SIZE = MAX_PAYLOAD - 4  # leave room for a 4-byte seq number
+
+
+class MsgType:
+    HEARTBEAT      = 0x01
+    ACK            = 0x02
+    NACK           = 0x03
+    CMD_CAPTURE    = 0x10
+    CMD_STREAM_ON  = 0x11
+    CMD_STREAM_OFF = 0x12
+    IMAGE_START    = 0x20
+    IMAGE_CHUNK    = 0x21
+    IMAGE_END      = 0x22
+    STATUS         = 0x30
+    ERROR          = 0xFF
+
+
+class CamLink:
+    def __init__(self, uart_id=1, baudrate=921600, tx=14, rx=15,
+                 timeout_ms=200, max_retries=5):
+        self.uart_id = uart_id
+        self.baudrate = baudrate
+        self.tx = tx
+        self.rx = rx
+        self.timeout_ms = timeout_ms
+        self.max_retries = max_retries
+        self._rx_buf = bytearray()
+        self._connected = False
+        self.uart = None
+        self._open()
+
+    # ---------------- low level ----------------
+    def _open(self):
+        try:
+            self.uart = UART(self.uart_id, baudrate=self.baudrate,
+                              tx=self.tx, rx=self.rx, timeout=self.timeout_ms)
+            self._rx_buf = bytearray()
+            self._connected = True
+        except Exception as e:
+            self._connected = False
+            print("[CamLink] open failed:", e)
+
+    @staticmethod
+    def _checksum(msg_type, length, payload):
+        chk = msg_type
+        chk ^= (length & 0xFF)
+        chk ^= ((length >> 8) & 0xFF)
+        for b in payload:
+            chk ^= b
+        return chk & 0xFF
+
+    # ---------------- public API ----------------
+    def send_message(self, msg_type, payload=b''):
+        """Build one framed packet and transmit it. Returns True on success."""
+        if not self._connected and not self.reconnect():
+            return False
+
+        if len(payload) > MAX_PAYLOAD:
+            raise ValueError("payload exceeds MAX_PAYLOAD (%d)" % MAX_PAYLOAD)
+
+        length = len(payload)
+        chk = self._checksum(msg_type, length, payload)
+
+        frame = bytearray()
+        frame.append(SOF)
+        frame.append(msg_type & 0xFF)
+        frame.append(length & 0xFF)
+        frame.append((length >> 8) & 0xFF)
+        frame.extend(payload)
+        frame.append(chk)
+        frame.append(EOF)
+
+        try:
+            written = self.uart.write(bytes(frame))
+            return written == len(frame)
+        except Exception as e:
+            print("[CamLink] send failed:", e)
+            self._connected = False
+            return False
+
+    def receive_message(self, timeout_ms=None):
+        """
+        Poll the UART, accumulate bytes into an internal buffer, and try to
+        extract one complete, verified packet before the timeout expires.
+        Returns (msg_type, payload) or None.
+        """
+        if not self._connected and not self.reconnect():
+            return None
+
+        deadline = time.ticks_add(
+            time.ticks_ms(),
+            timeout_ms if timeout_ms is not None else self.timeout_ms)
+
+        while True:
+            try:
+                chunk = self.uart.read()
+            except Exception as e:
+                print("[CamLink] read failed:", e)
+                self._connected = False
+                return None
+
+            if chunk:
+                self._rx_buf.extend(chunk)
+
+            result = self._try_extract_packet()
+            if result is not None:
+                return result
+
+            if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                return None
+            time.sleep_ms(2)
+
+    def verify_packet(self, frame):
+        """
+        Validate a raw byte sequence against the framing rules (SOF/EOF,
+        length consistency, checksum). Returns (msg_type, payload) if valid,
+        otherwise None.
+        """
+        if len(frame) < HEADER_LEN + FOOTER_LEN:
+            return None
+        if frame[0] != SOF or frame[-1] != EOF:
+            return None
+
+        msg_type = frame[1]
+        length = frame[2] | (frame[3] << 8)
+
+        if len(frame) != HEADER_LEN + length + FOOTER_LEN:
+            return None
+
+        payload = frame[HEADER_LEN:HEADER_LEN + length]
+        chk_received = frame[HEADER_LEN + length]
+        chk_expected = self._checksum(msg_type, length, payload)
+
+        if chk_received != chk_expected:
+            return None
+
+        return (msg_type, bytes(payload))
+
+    def reconnect(self, retries=None):
+        """
+        Recover a broken link: tear down and reopen the UART peripheral,
+        clear any stale buffered bytes, then confirm the peer is alive with
+        a heartbeat/ACK handshake. Uses linear backoff between attempts.
+        """
+        retries = retries if retries is not None else self.max_retries
+        for attempt in range(1, retries + 1):
+            print("[CamLink] reconnect attempt %d/%d" % (attempt, retries))
+            try:
+                if self.uart:
+                    self.uart.deinit()
+            except Exception:
+                pass
+
+            time.sleep_ms(50 * attempt)  # linear backoff
+            self._open()
+
+            if self._connected and self._handshake():
+                print("[CamLink] reconnected")
+                return True
+
+        print("[CamLink] reconnect failed after %d attempts" % retries)
+        self._connected = False
+        return False
+
+    def is_connected(self):
+        return self._connected
+
+    # ---------------- image transfer helpers ----------------
+    def send_image(self, jpeg_bytes):
+        """
+        Split a JPEG buffer into IMAGE_START / IMAGE_CHUNK* / IMAGE_END
+        frames and send them in order. Returns True only if every frame in
+        the sequence was accepted by send_message().
+        """
+        total_len = len(jpeg_bytes)
+        header = total_len.to_bytes(4, 'little')
+        if not self.send_message(MsgType.IMAGE_START, header):
+            return False
+
+        seq = 0
+        offset = 0
+        while offset < total_len:
+            piece = jpeg_bytes[offset:offset + IMAGE_CHUNK_SIZE]
+            payload = seq.to_bytes(4, 'little') + piece
+            if not self.send_message(MsgType.IMAGE_CHUNK, payload):
+                return False
+            offset += len(piece)
+            seq += 1
+
+        return self.send_message(MsgType.IMAGE_END, seq.to_bytes(4, 'little'))
+
+    def receive_image(self, timeout_ms=5000):
+        """
+        Reassemble a JPEG buffer from an IMAGE_START / IMAGE_CHUNK* /
+        IMAGE_END sequence. Returns the reassembled bytes, or None on
+        timeout / out-of-order chunk / malformed sequence.
+        """
+        deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
+        chunks = {}
+        expected_total = None
+
+        while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+            msg = self.receive_message(timeout_ms=200)
+            if msg is None:
+                continue
+            msg_type, payload = msg
+
+            if msg_type == MsgType.IMAGE_START:
+                expected_total = int.from_bytes(payload[0:4], 'little')
+                chunks = {}
+
+            elif msg_type == MsgType.IMAGE_CHUNK:
+                if len(payload) < 4:
+                    return None
+                seq = int.from_bytes(payload[0:4], 'little')
+                chunks[seq] = payload[4:]
+
+            elif msg_type == MsgType.IMAGE_END:
+                count = int.from_bytes(payload[0:4], 'little')
+                if len(chunks) != count:
+                    return None  # missing chunks
+                data = bytearray()
+                for i in range(count):
+                    if i not in chunks:
+                        return None
+                    data.extend(chunks[i])
+                if expected_total is not None and len(data) != expected_total:
+                    return None
+                return bytes(data)
+
+        return None  # overall timeout
+
+    # ---------------- helpers ----------------
+    def _handshake(self):
+        if not self.send_message(MsgType.HEARTBEAT, b''):
+            return False
+        reply = self.receive_message(timeout_ms=300)
+        return reply is not None and reply[0] in (MsgType.HEARTBEAT, MsgType.ACK)
+
+    def _try_extract_packet(self):
+        buf = self._rx_buf
+
+        # resync: drop bytes until a SOF is found
+        while buf and buf[0] != SOF:
+            buf.pop(0)
+
+        if len(buf) < HEADER_LEN:
+            return None
+
+        length = buf[2] | (buf[3] << 8)
+
+        if length > MAX_PAYLOAD:
+            # corrupt length field -- drop the bad SOF and resync next call
+            buf.pop(0)
+            return None
+
+        total_len = HEADER_LEN + length + FOOTER_LEN
+        if len(buf) < total_len:
+            return None  # wait for more bytes
+
+        frame = bytes(buf[:total_len])
+        result = self.verify_packet(frame)
+
+        if result is None:
+            # checksum/EOF mismatch -- drop the bad SOF and resync
+            buf.pop(0)
+            return None
+
+        del buf[:total_len]
+        return result

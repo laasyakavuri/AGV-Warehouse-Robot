@@ -1,0 +1,132 @@
+"""
+QRScanner.py
+
+High-level QR code scanning built on top of CameraDriver.
+Handles the capture -> locate -> decode pipeline for QR codes.
+"""
+
+import logging
+import time
+import cv2
+
+from CameraDriver import CameraDriver, CameraInitError
+
+logger = logging.getLogger("QRScanner")
+
+
+class QRScanner:
+    def __init__(self, camera: CameraDriver = None, min_quad_area=400):
+        """
+        Args:
+            camera: an existing CameraDriver instance to reuse. If None,
+                    a new default CameraDriver is created.
+            min_quad_area: minimum bounding-quad area (in pixels) for a
+                            detected QR pattern to be considered valid,
+                            used to reject noise/false positives.
+        """
+        self.camera = camera or CameraDriver()
+        self.min_quad_area = min_quad_area
+        self._detector = cv2.QRCodeDetector()
+
+    def initialize_camera(self):
+        """Convenience passthrough so callers can init camera + scanner together."""
+        return self.camera.initialize_camera()
+
+    def capture_frame(self):
+        """Convenience passthrough to the underlying CameraDriver."""
+        return self.camera.capture_frame()
+
+    def decode_qr(self, frame):
+        """
+        Attempts to locate and decode a QR code within a single frame.
+
+        Pipeline:
+          1. Convert frame to grayscale (QR detection is illumination-
+             sensitive; grayscale is faster and more robust than color).
+          2. Run cv2.QRCodeDetector.detectAndDecode(), which internally:
+                a. Locates the three QR "finder pattern" squares.
+                b. Computes a perspective transform to un-warp the code
+                   (handles tilt/rotation/skew).
+                c. Reads the modules (bits) and applies Reed-Solomon
+                   error correction to recover the payload bytes.
+          3. Filter out spurious detections whose bounding quad is too
+             small (min_quad_area) to be a reliable read.
+
+        Args:
+            frame: BGR image (numpy.ndarray) from capture_frame().
+
+        Returns:
+            (data, points) tuple:
+                data:   decoded string, or None if no valid QR was found.
+                points: 4x2 array of the QR code's corner coordinates in
+                        the frame, or None if not found.
+        """
+        if frame is None:
+            return None, None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        data, points, _ = self._detector.detectAndDecode(gray)
+
+        if not data or points is None:
+            return None, None
+
+        # Reject tiny/false-positive detections using bounding quad area
+        quad = points.reshape(-1, 2)
+        area = cv2.contourArea(quad)
+        if area < self.min_quad_area:
+            logger.debug("Rejected QR detection: area %.1f < min %d", area, self.min_quad_area)
+            return None, None
+
+        return data, quad
+
+    def scan_qr(self, timeout_sec=5.0, poll_interval=0.05):
+        """
+        Continuously captures frames and attempts to decode a QR code
+        until one is found or the timeout elapses.
+
+        Args:
+            timeout_sec: maximum time to keep scanning before giving up.
+            poll_interval: delay between capture attempts, to avoid
+                            pegging the CPU on cameras with fast read().
+
+        Returns:
+            (data, points) tuple, same as decode_qr(). (None, None) if
+            no QR code was found before timing out.
+
+        Raises:
+            CameraInitError if the camera wasn't initialized first.
+        """
+        start = time.time()
+        attempts = 0
+
+        while time.time() - start < timeout_sec:
+            frame = self.capture_frame()
+            attempts += 1
+
+            data, points = self.decode_qr(frame)
+            if data:
+                logger.info("QR decoded after %d attempts: %s", attempts, data)
+                return data, points
+
+            time.sleep(poll_interval)
+
+        logger.info("QR scan timed out after %.1fs (%d attempts)", timeout_sec, attempts)
+        return None, None
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    scanner = QRScanner()
+    try:
+        scanner.initialize_camera()
+        result, corners = scanner.scan_qr(timeout_sec=10.0)
+        if result:
+            print(f"QR payload: {result}")
+        else:
+            print("No QR code detected.")
+    except CameraInitError as e:
+        print(f"Camera error: {e}")
+    finally:
+        scanner.camera.release()

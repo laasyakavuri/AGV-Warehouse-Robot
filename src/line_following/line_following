@@ -1,0 +1,147 @@
+"""
+LineFollower.py
+
+Line-following control module for MainController.
+
+Integrates:
+    - MotorDriver   : low-level motor speed control (left/right wheels)
+    - IRArraySensor : reads an array of IR reflectance sensors and reports
+                      which sensors currently detect the line
+
+Control strategy
+-----------------
+The IR array is treated as N sensors laid out left-to-right across the
+robot's underside, each returning a binary "on line" (1) / "off line" (0)
+reading (or an analog value that IRArraySensor thresholds internally).
+
+Each sensor position is assigned a fixed weight, symmetric about zero:
+
+    5-sensor example:  [-2, -1, 0, +1, +2]
+
+A weighted average of the "active" sensors gives a single signed error
+value:
+
+    error = sum(weight_i * active_i) / sum(active_i)
+
+    error  < 0  -> line is to the LEFT of center  -> correct_left()
+    error  > 0  -> line is to the RIGHT of center  -> correct_right()
+    error == 0  -> line is centered                -> keep_center()
+
+This is a simple proportional (P) controller: the magnitude of the error
+scales how hard the robot turns, so small drifts produce gentle
+corrections and large drifts produce sharper ones. If no sensor sees the
+line at all, the robot falls back to its last known direction bias so it
+can re-acquire the line instead of stopping dead.
+"""
+
+from Motor.MotorDriver import MotorDriver
+from Sensors.IRArraySensor import IRArraySensor
+
+
+class LineFollower:
+    def __init__(self, motor_driver: MotorDriver, ir_sensor: IRArraySensor,
+                 base_speed: int = 60, max_speed: int = 100,
+                 turn_gain: float = 25.0, lost_line_timeout: int = 10):
+        """
+        motor_driver      : MotorDriver instance controlling both wheels
+        ir_sensor         : IRArraySensor instance reading the line array
+        base_speed        : forward speed (0-100) used when centered
+        max_speed         : upper clamp for any wheel speed (0-100)
+        turn_gain         : proportional gain applied to sensor error
+        lost_line_timeout : consecutive lost-line reads before stopping
+        """
+        self.motor = motor_driver
+        self.sensor = ir_sensor
+        self.base_speed = base_speed
+        self.max_speed = max_speed
+        self.turn_gain = turn_gain
+        self.lost_line_timeout = lost_line_timeout
+
+        # Sensor weights: symmetric, center sensor(s) = 0
+        n = self.sensor.num_sensors
+        mid = (n - 1) / 2.0
+        self._weights = [i - mid for i in range(n)]
+
+        self._last_error = 0.0
+        self._lost_count = 0
+
+    # ------------------------------------------------------------------
+    # Public control loop
+    # ------------------------------------------------------------------
+    def follow_line(self):
+        """
+        Single control-loop iteration. Call repeatedly (e.g. in the main
+        loop or a scheduler tick). Reads the IR array, computes the line
+        error, and dispatches to the appropriate correction method.
+        """
+        readings = self.sensor.read()  # list of 0/1 (or thresholded) values
+
+        error = self._compute_error(readings)
+
+        if error is None:
+            # No sensor sees the line -> use last known direction to
+            # search for it again, rather than halting immediately.
+            self._lost_count += 1
+            if self._lost_count > self.lost_line_timeout:
+                self.motor.stop()
+                return
+            error = self._last_error * 2  # bias harder toward last heading
+        else:
+            self._lost_count = 0
+            self._last_error = error
+
+        if error < -0.1:
+            self.correct_left(error)
+        elif error > 0.1:
+            self.correct_right(error)
+        else:
+            self.keep_center()
+
+    # ------------------------------------------------------------------
+    # Correction primitives
+    # ------------------------------------------------------------------
+    def correct_left(self, error: float = -1.0):
+        """
+        Line has drifted left of center -> slow the left wheel / speed up
+        the right wheel so the robot rotates left back onto the line.
+        Turn sharpness scales with |error|.
+        """
+        adjustment = min(abs(error) * self.turn_gain, self.max_speed)
+        left_speed = self._clamp(self.base_speed - adjustment)
+        right_speed = self._clamp(self.base_speed + adjustment)
+        self.motor.set_speed(left_speed, right_speed)
+
+    def correct_right(self, error: float = 1.0):
+        """
+        Line has drifted right of center -> slow the right wheel / speed
+        up the left wheel so the robot rotates right back onto the line.
+        Turn sharpness scales with |error|.
+        """
+        adjustment = min(abs(error) * self.turn_gain, self.max_speed)
+        left_speed = self._clamp(self.base_speed + adjustment)
+        right_speed = self._clamp(self.base_speed - adjustment)
+        self.motor.set_speed(left_speed, right_speed)
+
+    def keep_center(self):
+        """
+        Line is centered -> drive both wheels evenly at base speed.
+        """
+        speed = self._clamp(self.base_speed)
+        self.motor.set_speed(speed, speed)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _compute_error(self, readings):
+        """
+        Weighted-average error from IR readings.
+        Returns None if no sensor currently detects the line.
+        """
+        active_sum = sum(readings)
+        if active_sum == 0:
+            return None
+        weighted_sum = sum(w * r for w, r in zip(self._weights, readings))
+        return weighted_sum / active_sum
+
+    def _clamp(self, speed):
+        return max(0, min(self.max_speed, speed))

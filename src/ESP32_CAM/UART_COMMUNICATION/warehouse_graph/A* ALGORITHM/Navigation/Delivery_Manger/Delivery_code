@@ -1,0 +1,329 @@
+"""
+DeliveryManager.py
+
+Coordinates the end-to-end package delivery sequence:
+  1. verify_destination()  - confirms the robot/vehicle has arrived at the
+                              correct, expected destination before releasing
+                              anything.
+  2. deliver_package()     - actuates the ServoTray to release/present the
+                              package to the recipient.
+  3. confirm_delivery()    - verifies the package has actually left the tray
+                              (or been accepted) and logs/reports completion.
+
+This module integrates with the ServoTray hardware driver, which is expected
+to live alongside this module in the firmware hardware stack
+(e.g. firmware/MainController/src/Hardware/ServoTray.py).
+
+If your project structure differs, adjust the import at the top of this
+file accordingly.
+"""
+
+import logging
+import time
+from enum import Enum
+from typing import Optional, Callable
+
+try:
+    # Expected location of the ServoTray driver.
+    from Hardware.ServoTray import ServoTray, ServoTrayState
+except ImportError:
+    # Fallback so this module can still be imported / unit-tested in
+    # isolation if the hardware driver isn't on the path yet.
+    logging.getLogger(__name__).warning(
+        "Could not import Hardware.ServoTray; using stub definitions. "
+        "Update the import path to match your project layout."
+    )
+
+    class ServoTrayState(Enum):
+        CLOSED = "closed"
+        OPEN = "open"
+        FAULT = "fault"
+
+    class ServoTray:
+        def __init__(self, *args, **kwargs):
+            self._state = ServoTrayState.CLOSED
+
+        def open_tray(self) -> bool:
+            self._state = ServoTrayState.OPEN
+            return True
+
+        def close_tray(self) -> bool:
+            self._state = ServoTrayState.CLOSED
+            return True
+
+        def get_state(self) -> "ServoTrayState":
+            return self._state
+
+        def is_package_present(self) -> bool:
+            return False
+
+
+logger = logging.getLogger(__name__)
+
+
+class DeliveryStatus(Enum):
+    IDLE = "idle"
+    VERIFYING_DESTINATION = "verifying_destination"
+    DESTINATION_CONFIRMED = "destination_confirmed"
+    DESTINATION_MISMATCH = "destination_mismatch"
+    DELIVERING = "delivering"
+    DELIVERED_PENDING_CONFIRM = "delivered_pending_confirm"
+    CONFIRMED = "confirmed"
+    FAILED = "failed"
+
+
+class DeliveryError(Exception):
+    """Raised when a delivery step cannot be completed safely."""
+    pass
+
+
+class DeliveryManager:
+    """
+    Orchestrates verification, release, and confirmation of a package
+    delivery using the ServoTray hardware interface.
+    """
+
+    def __init__(
+        self,
+        servo_tray: Optional[ServoTray] = None,
+        location_provider: Optional[Callable[[], tuple]] = None,
+        destination_tolerance_m: float = 1.0,
+        confirm_timeout_s: float = 10.0,
+        confirm_poll_interval_s: float = 0.5,
+    ):
+        """
+        Args:
+            servo_tray: An instance of the ServoTray hardware driver. If not
+                provided, a default ServoTray() is constructed.
+            location_provider: Optional callable returning the current
+                (x, y) position of the robot, e.g. from GPS/odometry. Used
+                by verify_destination(). If omitted, verify_destination()
+                will only compare provided coordinates/IDs directly.
+            destination_tolerance_m: Allowed distance (meters) between
+                current position and target destination to count as
+                "arrived".
+            confirm_timeout_s: How long confirm_delivery() will wait for
+                the package to be detected as removed from the tray.
+            confirm_poll_interval_s: Polling interval while waiting for
+                confirmation.
+        """
+        self.servo_tray = servo_tray if servo_tray is not None else ServoTray()
+        self.location_provider = location_provider
+        self.destination_tolerance_m = destination_tolerance_m
+        self.confirm_timeout_s = confirm_timeout_s
+        self.confirm_poll_interval_s = confirm_poll_interval_s
+
+        self.status = DeliveryStatus.IDLE
+        self._current_destination_id: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Step 1: Destination verification
+    # ------------------------------------------------------------------
+    def verify_destination(
+        self,
+        expected_destination_id: str,
+        expected_coordinates: Optional[tuple] = None,
+        current_coordinates: Optional[tuple] = None,
+    ) -> bool:
+        """
+        Confirms the robot is at the correct destination before any
+        package is released.
+
+        Args:
+            expected_destination_id: Identifier of the destination this
+                delivery run is targeting (e.g. order/stop ID).
+            expected_coordinates: Optional (x, y) coordinates of the
+                expected destination, for a physical position check.
+            current_coordinates: Optional (x, y) current position. If not
+                supplied, self.location_provider() is used if available.
+
+        Returns:
+            True if the destination is verified, False otherwise.
+        """
+        self.status = DeliveryStatus.VERIFYING_DESTINATION
+        logger.info("Verifying destination '%s'...", expected_destination_id)
+
+        if not expected_destination_id:
+            logger.error("No expected_destination_id provided.")
+            self.status = DeliveryStatus.DESTINATION_MISMATCH
+            return False
+
+        # Resolve current position if a coordinate check is requested.
+        if expected_coordinates is not None:
+            if current_coordinates is None and self.location_provider is not None:
+                try:
+                    current_coordinates = self.location_provider()
+                except Exception as exc:
+                    logger.error("location_provider() failed: %s", exc)
+                    self.status = DeliveryStatus.DESTINATION_MISMATCH
+                    return False
+
+            if current_coordinates is None:
+                logger.error(
+                    "No current_coordinates available to verify against "
+                    "expected_coordinates."
+                )
+                self.status = DeliveryStatus.DESTINATION_MISMATCH
+                return False
+
+            distance = self._distance(expected_coordinates, current_coordinates)
+            if distance > self.destination_tolerance_m:
+                logger.warning(
+                    "Destination mismatch: %.2fm away (tolerance %.2fm).",
+                    distance,
+                    self.destination_tolerance_m,
+                )
+                self.status = DeliveryStatus.DESTINATION_MISMATCH
+                return False
+
+            logger.info(
+                "Position check passed: %.2fm from target (tolerance %.2fm).",
+                distance,
+                self.destination_tolerance_m,
+            )
+
+        self._current_destination_id = expected_destination_id
+        self.status = DeliveryStatus.DESTINATION_CONFIRMED
+        logger.info("Destination '%s' verified.", expected_destination_id)
+        return True
+
+    @staticmethod
+    def _distance(coord_a: tuple, coord_b: tuple) -> float:
+        (ax, ay), (bx, by) = coord_a, coord_b
+        return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+
+    # ------------------------------------------------------------------
+    # Step 2: Package delivery (tray release)
+    # ------------------------------------------------------------------
+    def deliver_package(self) -> bool:
+        """
+        Opens the ServoTray to present/release the package. Requires that
+        verify_destination() has already succeeded for this run.
+
+        Returns:
+            True if the tray was opened successfully, False otherwise.
+
+        Raises:
+            DeliveryError: if called before the destination is verified.
+        """
+        if self.status != DeliveryStatus.DESTINATION_CONFIRMED:
+            raise DeliveryError(
+                "Cannot deliver package: destination has not been verified "
+                f"(current status: {self.status.value})."
+            )
+
+        logger.info(
+            "Delivering package for destination '%s'...",
+            self._current_destination_id,
+        )
+        self.status = DeliveryStatus.DELIVERING
+
+        try:
+            opened = self.servo_tray.open_tray()
+        except Exception as exc:
+            logger.error("ServoTray failed to open: %s", exc)
+            self.status = DeliveryStatus.FAILED
+            return False
+
+        if not opened or self.servo_tray.get_state() != ServoTrayState.OPEN:
+            logger.error("ServoTray did not report OPEN state after actuation.")
+            self.status = DeliveryStatus.FAILED
+            return False
+
+        logger.info("ServoTray opened. Package presented to recipient.")
+        self.status = DeliveryStatus.DELIVERED_PENDING_CONFIRM
+        return True
+
+    # ------------------------------------------------------------------
+    # Step 3: Delivery confirmation
+    # ------------------------------------------------------------------
+    def confirm_delivery(self) -> bool:
+        """
+        Confirms that the package has actually been removed from the tray
+        by the recipient, then closes the tray. Polls
+        servo_tray.is_package_present() until it returns False or the
+        configured timeout elapses.
+
+        Returns:
+            True if removal was confirmed and the tray closed successfully,
+            False otherwise.
+
+        Raises:
+            DeliveryError: if called before deliver_package() has run.
+        """
+        if self.status != DeliveryStatus.DELIVERED_PENDING_CONFIRM:
+            raise DeliveryError(
+                "Cannot confirm delivery: package has not been delivered yet "
+                f"(current status: {self.status.value})."
+            )
+
+        logger.info("Waiting for package removal to confirm delivery...")
+        deadline = time.monotonic() + self.confirm_timeout_s
+
+        package_removed = False
+        while time.monotonic() < deadline:
+            try:
+                present = self.servo_tray.is_package_present()
+            except Exception as exc:
+                logger.error("Error polling ServoTray package sensor: %s", exc)
+                break
+
+            if not present:
+                package_removed = True
+                break
+
+            time.sleep(self.confirm_poll_interval_s)
+
+        if not package_removed:
+            logger.warning(
+                "Delivery confirmation timed out after %.1fs; package still "
+                "detected in tray.",
+                self.confirm_timeout_s,
+            )
+            self.status = DeliveryStatus.FAILED
+            return False
+
+        try:
+            closed = self.servo_tray.close_tray()
+        except Exception as exc:
+            logger.error("ServoTray failed to close after confirmation: %s", exc)
+            self.status = DeliveryStatus.FAILED
+            return False
+
+        if not closed or self.servo_tray.get_state() != ServoTrayState.CLOSED:
+            logger.error("ServoTray did not report CLOSED state after closing.")
+            self.status = DeliveryStatus.FAILED
+            return False
+
+        logger.info(
+            "Delivery to '%s' confirmed and tray closed.",
+            self._current_destination_id,
+        )
+        self.status = DeliveryStatus.CONFIRMED
+        return True
+
+    # ------------------------------------------------------------------
+    # Convenience orchestration
+    # ------------------------------------------------------------------
+    def run_delivery(
+        self,
+        expected_destination_id: str,
+        expected_coordinates: Optional[tuple] = None,
+        current_coordinates: Optional[tuple] = None,
+    ) -> bool:
+        """
+        Convenience method that runs all three steps in sequence:
+        verify_destination -> deliver_package -> confirm_delivery.
+
+        Returns:
+            True only if all three steps succeed.
+        """
+        if not self.verify_destination(
+            expected_destination_id, expected_coordinates, current_coordinates
+        ):
+            return False
+
+        if not self.deliver_package():
+            return False
+
+        return self.confirm_delivery()

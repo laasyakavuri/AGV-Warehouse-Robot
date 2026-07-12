@@ -1,0 +1,277 @@
+"""
+ServoTray.py
+------------
+Delivery hardware module for the MainController firmware.
+
+Drives an SG90 micro servo (ESP32, MicroPython) to open and close a
+delivery tray. Provides calibrated angle control, safety-limited
+movement, and basic fault handling so a bad angle or a hardware
+fault on the PWM peripheral can never physically over-drive the servo.
+
+Hardware:
+    - ESP32 (any board exposing machine.PWM on a GPIO)
+    - SG90 9g micro servo
+      * Control signal : 50 Hz PWM
+      * Pulse width     : ~500us (0 deg) to ~2500us (180 deg), datasheet
+                          nominal is 1ms-2ms but SG90 clones commonly
+                          reach further, hence the wider default range.
+
+Wiring (default):
+    - Servo signal -> GPIO 13 (change SERVO_PIN below to match your board)
+    - Servo V+     -> 5V (external supply recommended, not the ESP32 3V3 rail)
+    - Servo GND    -> common GND with ESP32
+
+Author: MainController firmware team
+"""
+
+import time
+
+try:
+    from machine import Pin, PWM
+except ImportError:
+    # Allows the module to be imported off-device (e.g. for linting/tests)
+    # without machine being available.
+    Pin = None
+    PWM = None
+
+
+class ServoTrayError(Exception):
+    """Raised for tray/servo faults: bad calibration, out-of-range
+    angles, or PWM hardware failures."""
+    pass
+
+
+class ServoTray:
+    """
+    Controls an SG90 servo that opens/closes a delivery tray.
+
+    Angle convention:
+        0 deg   -> tray fully closed (mechanical stop)
+        max_angle -> tray fully open (mechanical stop)
+
+    Safety limits:
+        All motion is clamped to [SAFE_MIN_ANGLE, SAFE_MAX_ANGLE], which
+        default to the SG90's full mechanical range (0-180). Set
+        `safe_min_angle` / `safe_max_angle` tighter than that if the
+        physical tray linkage cannot handle the full sweep, since the
+        servo itself has no end-stop feedback and will stall/strain
+        against the tray hardware if driven past its physical limit.
+    """
+
+    # --- SG90 calibration defaults -----------------------------------
+    # Pulse widths in microseconds. Adjust after bench-testing a given
+    # servo unit, as SG90 clones vary in end-stop pulse width.
+    DEFAULT_MIN_US = 500     # pulse width at 0 deg
+    DEFAULT_MAX_US = 2500    # pulse width at 180 deg
+    PWM_FREQ_HZ = 50         # standard analog servo control frequency
+
+    # Absolute mechanical range of an SG90. Never exceeded regardless
+    # of caller input or calibration, since the servo hard-stops here.
+    ABSOLUTE_MIN_ANGLE = 0
+    ABSOLUTE_MAX_ANGLE = 180
+
+    def __init__(
+        self,
+        pin=13,
+        open_angle=90,
+        close_angle=0,
+        min_us=DEFAULT_MIN_US,
+        max_us=DEFAULT_MAX_US,
+        safe_min_angle=ABSOLUTE_MIN_ANGLE,
+        safe_max_angle=ABSOLUTE_MAX_ANGLE,
+        step_delay_ms=15,
+        step_size_deg=2,
+    ):
+        """
+        Args:
+            pin: GPIO number driving the servo signal line.
+            open_angle: Angle (deg) considered "tray open". Adjustable
+                per-mechanism; validated against safety limits.
+            close_angle: Angle (deg) considered "tray closed".
+            min_us / max_us: Calibrated pulse widths for 0/180 deg.
+            safe_min_angle / safe_max_angle: Software safety limits,
+                tighter than or equal to the servo's absolute range.
+            step_delay_ms: Delay between incremental steps when sweeping,
+                used to avoid slamming the tray and to limit current
+                inrush from a fast, large angle change.
+            step_size_deg: Degrees moved per step during rotate_servo().
+
+        Raises:
+            ServoTrayError: if calibration or angle arguments are invalid.
+        """
+        self._validate_calibration(min_us, max_us, safe_min_angle, safe_max_angle)
+        self._validate_angle(open_angle, safe_min_angle, safe_max_angle, "open_angle")
+        self._validate_angle(close_angle, safe_min_angle, safe_max_angle, "close_angle")
+
+        self.pin_no = pin
+        self.min_us = min_us
+        self.max_us = max_us
+        self.safe_min_angle = safe_min_angle
+        self.safe_max_angle = safe_max_angle
+        self.open_angle = open_angle
+        self.close_angle = close_angle
+        self.step_delay_ms = step_delay_ms
+        self.step_size_deg = max(1, step_size_deg)
+
+        self._current_angle = None  # unknown until first move
+        self._pwm = None
+        self._is_open = False
+
+        self._init_hardware()
+
+    # ------------------------------------------------------------------
+    # Hardware setup
+    # ------------------------------------------------------------------
+    def _init_hardware(self):
+        """Initializes the PWM peripheral. Raises ServoTrayError on failure."""
+        if PWM is None or Pin is None:
+            raise ServoTrayError(
+                "machine.PWM/Pin unavailable - not running on MicroPython/ESP32"
+            )
+        try:
+            self._pwm = PWM(Pin(self.pin_no), freq=self.PWM_FREQ_HZ)
+        except Exception as exc:
+            raise ServoTrayError(
+                "Failed to initialize PWM on pin {}: {}".format(self.pin_no, exc)
+            )
+        # Move to the closed position on boot so the tray starts in a
+        # known, safe state.
+        try:
+            self.set_angle(self.close_angle)
+        except ServoTrayError:
+            # Don't let a startup move failure prevent object construction;
+            # caller can inspect/retry via set_angle explicitly.
+            pass
+
+    def _validate_calibration(self, min_us, max_us, safe_min_angle, safe_max_angle):
+        if min_us <= 0 or max_us <= 0 or min_us >= max_us:
+            raise ServoTrayError(
+                "Invalid pulse calibration: min_us={} max_us={}".format(min_us, max_us)
+            )
+        if not (self.ABSOLUTE_MIN_ANGLE <= safe_min_angle < safe_max_angle <= self.ABSOLUTE_MAX_ANGLE):
+            raise ServoTrayError(
+                "Invalid safety limits: safe_min_angle={} safe_max_angle={} "
+                "(must satisfy {} <= min < max <= {})".format(
+                    safe_min_angle, safe_max_angle,
+                    self.ABSOLUTE_MIN_ANGLE, self.ABSOLUTE_MAX_ANGLE,
+                )
+            )
+
+    def _validate_angle(self, angle, safe_min_angle, safe_max_angle, label="angle"):
+        if not isinstance(angle, (int, float)):
+            raise ServoTrayError("{} must be numeric, got {}".format(label, type(angle)))
+        if not (safe_min_angle <= angle <= safe_max_angle):
+            raise ServoTrayError(
+                "{}={} outside safety limits [{}, {}]".format(
+                    label, angle, safe_min_angle, safe_max_angle
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # Low-level angle -> PWM conversion
+    # ------------------------------------------------------------------
+    def _angle_to_duty_ns(self, angle):
+        """Converts an angle (deg) to a duty cycle in nanoseconds using
+        the calibrated pulse-width range."""
+        span_us = self.max_us - self.min_us
+        pulse_us = self.min_us + (span_us * (angle / self.ABSOLUTE_MAX_ANGLE))
+        return int(pulse_us * 1000)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def set_angle(self, angle):
+        """
+        Moves the servo directly to `angle` (deg), clamped to the
+        configured safety limits.
+
+        Raises:
+            ServoTrayError: if angle is invalid or the PWM write fails.
+        """
+        self._validate_angle(angle, self.safe_min_angle, self.safe_max_angle)
+
+        if self._pwm is None:
+            raise ServoTrayError("Servo PWM not initialized")
+
+        try:
+            duty_ns = self._angle_to_duty_ns(angle)
+            self._pwm.duty_ns(duty_ns)
+        except Exception as exc:
+            raise ServoTrayError("Failed to set angle {}: {}".format(angle, exc))
+
+        self._current_angle = angle
+        self._is_open = abs(angle - self.open_angle) < abs(angle - self.close_angle)
+
+    def rotate_servo(self, target_angle):
+        """
+        Sweeps the servo smoothly from its current angle to
+        `target_angle`, moving in `step_size_deg` increments with
+        `step_delay_ms` pauses between steps. This avoids slamming the
+        tray mechanism and limits inrush current versus a single jump.
+
+        Raises:
+            ServoTrayError: if target_angle is invalid or a step fails.
+        """
+        self._validate_angle(target_angle, self.safe_min_angle, self.safe_max_angle)
+
+        start_angle = self._current_angle if self._current_angle is not None else self.close_angle
+        if target_angle == start_angle:
+            self.set_angle(target_angle)
+            return
+
+        direction = 1 if target_angle > start_angle else -1
+        angle = start_angle
+
+        while (direction == 1 and angle < target_angle) or (direction == -1 and angle > target_angle):
+            angle += direction * self.step_size_deg
+            # Clamp final step so we land exactly on target_angle rather
+            # than overshooting past it.
+            if (direction == 1 and angle > target_angle) or (direction == -1 and angle < target_angle):
+                angle = target_angle
+            self.set_angle(angle)
+            time.sleep_ms(self.step_delay_ms)
+
+    def open_tray(self):
+        """Opens the delivery tray to the configured open_angle."""
+        try:
+            self.rotate_servo(self.open_angle)
+        except ServoTrayError as exc:
+            raise ServoTrayError("open_tray failed: {}".format(exc))
+
+    def close_tray(self):
+        """Closes the delivery tray to the configured close_angle."""
+        try:
+            self.rotate_servo(self.close_angle)
+        except ServoTrayError as exc:
+            raise ServoTrayError("close_tray failed: {}".format(exc))
+
+    def is_open(self):
+        """Returns True if the last commanded position was closer to
+        open_angle than close_angle."""
+        return self._is_open
+
+    def current_angle(self):
+        """Returns the last commanded angle, or None if the servo has
+        not been moved yet."""
+        return self._current_angle
+
+    def set_open_angle(self, angle):
+        """Adjusts the 'open' position at runtime, subject to safety limits."""
+        self._validate_angle(angle, self.safe_min_angle, self.safe_max_angle, "open_angle")
+        self.open_angle = angle
+
+    def set_close_angle(self, angle):
+        """Adjusts the 'closed' position at runtime, subject to safety limits."""
+        self._validate_angle(angle, self.safe_min_angle, self.safe_max_angle, "close_angle")
+        self.close_angle = angle
+
+    def deinit(self):
+        """Releases the PWM peripheral. Call when shutting down or before
+        re-initializing the pin elsewhere."""
+        if self._pwm is not None:
+            try:
+                self._pwm.deinit()
+            except Exception as exc:
+                raise ServoTrayError("Failed to deinit PWM: {}".format(exc))
+            finally:
+                self._pwm = None

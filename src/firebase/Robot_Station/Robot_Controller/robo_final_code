@@ -1,0 +1,132 @@
+"""
+Logger.py
+
+Lightweight, thread-safe logging utility for the robot controller core.
+Provides leveled logging to console and (optionally) to a rotating log
+file, plus timing helpers used by the Scheduler for jitter/overrun
+diagnostics.
+
+No external dependencies beyond the Python standard library, so it is
+safe to use on constrained onboard compute (Raspberry Pi / Jetson /
+microcontroller companion computer running MicroPython-compatible CPython).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+import threading
+from enum import IntEnum
+from typing import Optional
+
+
+class LogLevel(IntEnum):
+    DEBUG = 10
+    INFO = 20
+    WARNING = 30
+    ERROR = 40
+    CRITICAL = 50
+
+
+_LEVEL_NAMES = {
+    LogLevel.DEBUG: "DEBUG",
+    LogLevel.INFO: "INFO",
+    LogLevel.WARNING: "WARN",
+    LogLevel.ERROR: "ERROR",
+    LogLevel.CRITICAL: "CRIT",
+}
+
+_LEVEL_COLORS = {
+    LogLevel.DEBUG: "\033[90m",     # grey
+    LogLevel.INFO: "\033[37m",      # white
+    LogLevel.WARNING: "\033[33m",   # yellow
+    LogLevel.ERROR: "\033[31m",     # red
+    LogLevel.CRITICAL: "\033[41m",  # red background
+}
+_RESET = "\033[0m"
+
+
+class Logger:
+    """
+    Singleton-style logger. Instantiate once via Logger.get_instance()
+    (RobotController does this) and share the same instance across all
+    modules (Scheduler, motor drivers, sensor managers, etc.) so log
+    output stays chronologically interleaved and consistently formatted.
+    """
+
+    _instance: Optional["Logger"] = None
+    _lock = threading.Lock()
+
+    def __init__(
+        self,
+        name: str = "RobotController",
+        level: LogLevel = LogLevel.INFO,
+        log_to_file: bool = False,
+        log_dir: str = "logs",
+        use_color: bool = True,
+    ) -> None:
+        self.name = name
+        self.level = level
+        self.use_color = use_color and sys.stdout.isatty()
+        self._write_lock = threading.Lock()
+        self._file_handle = None
+
+        if log_to_file:
+            os.makedirs(log_dir, exist_ok=True)
+            filename = time.strftime("robot_%Y%m%d_%H%M%S.log")
+            self._file_handle = open(
+                os.path.join(log_dir, filename), "a", buffering=1
+            )
+
+    # ------------------------------------------------------------------
+    # Singleton accessor
+    # ------------------------------------------------------------------
+    @classmethod
+    def get_instance(cls, **kwargs) -> "Logger":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = Logger(**kwargs)
+            return cls._instance
+
+    # ------------------------------------------------------------------
+    # Core logging
+    # ------------------------------------------------------------------
+    def _emit(self, level: LogLevel, tag: str, message: str) -> None:
+        if level < self.level:
+            return
+
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        millis = int((time.time() % 1) * 1000)
+        level_name = _LEVEL_NAMES[level]
+        line = f"[{timestamp}.{millis:03d}] [{level_name:<5}] [{tag}] {message}"
+
+        with self._write_lock:
+            if self.use_color:
+                color = _LEVEL_COLORS.get(level, "")
+                print(f"{color}{line}{_RESET}")
+            else:
+                print(line)
+
+            if self._file_handle:
+                self._file_handle.write(line + "\n")
+
+    def debug(self, tag: str, message: str) -> None:
+        self._emit(LogLevel.DEBUG, tag, message)
+
+    def info(self, tag: str, message: str) -> None:
+        self._emit(LogLevel.INFO, tag, message)
+
+    def warning(self, tag: str, message: str) -> None:
+        self._emit(LogLevel.WARNING, tag, message)
+
+    def error(self, tag: str, message: str) -> None:
+        self._emit(LogLevel.ERROR, tag, message)
+
+    def critical(self, tag: str, message: str) -> None:
+        self._emit(LogLevel.CRITICAL, tag, message)
+
+    def close(self) -> None:
+        if self._file_handle:
+            self._file_handle.close()
+            self._file_handle = None

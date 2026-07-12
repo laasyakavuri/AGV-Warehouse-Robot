@@ -1,0 +1,205 @@
+"""
+JunctionDetector.py
+
+Junction detection logic for a line-following robot.
+
+Assumes a linear array of IR reflectance sensors mounted across the front
+of the robot, indexed left-to-right, e.g. for a 5-sensor array:
+
+    [S0] [S1] [S2] [S3] [S4]
+    far      center      far
+    left                right
+
+Each sensor reading is a bool (or 0/1 int):
+    True (1)  -> sensor is OVER the line (dark surface detected)
+    False (0) -> sensor is OFF the line (background surface detected)
+
+Junction shapes produce characteristic activation patterns:
+
+    Straight line   :  . . X . .        only center sensor(s) active
+    Left branch     :  X X . . .        left-side sensors active
+    Right branch    :  . . . X X        right-side sensors active
+    Cross / T (both):  X X X X X        nearly all sensors active
+    Dead end        :  . . . . .        no sensors active
+
+This module is sensor-count agnostic: it works with any odd-length
+sensor array (5, 7, 9, ...) by looking at proportional zones (left
+third, center third, right third) rather than hardcoded indices.
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Sequence
+
+
+class JunctionType(Enum):
+    NONE = "none"           # still just following a straight/curved line
+    LEFT = "left"            # left branch available
+    RIGHT = "right"          # right branch available
+    CROSS = "cross"          # both branches (or full 4-way / T) available
+    DEAD_END = "dead_end"    # no line detected at all
+
+
+@dataclass
+class JunctionConfig:
+    """Tunable thresholds for junction classification."""
+    # Minimum fraction of sensors in a zone that must be active for
+    # that zone to be considered "activated".
+    zone_active_ratio: float = 0.5
+    # Minimum total active-sensor ratio across the whole array to
+    # call something a cross/T junction (as opposed to just a wide line).
+    cross_active_ratio: float = 0.8
+    # Number of consecutive all-off readings required before declaring
+    # a dead end, to filter out momentary sensor noise / gaps.
+    dead_end_debounce: int = 3
+
+
+class JunctionDetector:
+    """
+    Stateful junction detector. Feed it sensor readings on each control
+    loop tick via update(); it debounces dead-end detection and exposes
+    the individual detect_* helpers for one-shot pattern checks.
+    """
+
+    def __init__(self, num_sensors: int, config: JunctionConfig = None):
+        if num_sensors < 3:
+            raise ValueError("JunctionDetector needs at least 3 sensors")
+        self.num_sensors = num_sensors
+        self.config = config or JunctionConfig()
+        self._dead_end_streak = 0
+
+    # ------------------------------------------------------------------
+    # Zone helpers
+    # ------------------------------------------------------------------
+
+    def _zones(self, sensors: Sequence[bool]):
+        """Split the sensor array into (left, center, right) index slices."""
+        n = self.num_sensors
+        third = max(1, n // 3)
+        left = sensors[0:third]
+        right = sensors[n - third:n]
+        center = sensors[third:n - third] if n - third > third else sensors[third // 2: third // 2 + 1]
+        return left, center, right
+
+    def _ratio_active(self, group: Sequence[bool]) -> float:
+        if not group:
+            return 0.0
+        return sum(1 for s in group if s) / len(group)
+
+    # ------------------------------------------------------------------
+    # Individual pattern detectors
+    # ------------------------------------------------------------------
+
+    def detect_left(self, sensors: Sequence[bool]) -> bool:
+        """
+        Left junction: left-zone sensors are activated above threshold
+        while the right zone is not (distinguishes from a cross).
+        """
+        self._validate(sensors)
+        left, _, right = self._zones(sensors)
+        left_active = self._ratio_active(left) >= self.config.zone_active_ratio
+        right_active = self._ratio_active(right) >= self.config.zone_active_ratio
+        return left_active and not right_active
+
+    def detect_right(self, sensors: Sequence[bool]) -> bool:
+        """
+        Right junction: right-zone sensors are activated above threshold
+        while the left zone is not (distinguishes from a cross).
+        """
+        self._validate(sensors)
+        left, _, right = self._zones(sensors)
+        left_active = self._ratio_active(left) >= self.config.zone_active_ratio
+        right_active = self._ratio_active(right) >= self.config.zone_active_ratio
+        return right_active and not left_active
+
+    def detect_cross(self, sensors: Sequence[bool]) -> bool:
+        """
+        Cross / T junction: most of the array is active simultaneously,
+        meaning both a left branch and a right branch (or a full
+        perpendicular line) are present under the sensor bar.
+        """
+        self._validate(sensors)
+        left, _, right = self._zones(sensors)
+        left_active = self._ratio_active(left) >= self.config.zone_active_ratio
+        right_active = self._ratio_active(right) >= self.config.zone_active_ratio
+        overall_active = self._ratio_active(sensors) >= self.config.cross_active_ratio
+        return left_active and right_active and overall_active
+
+    def detect_dead_end(self, sensors: Sequence[bool]) -> bool:
+        """
+        Dead end: no sensor in the array detects the line at all.
+        This is a single-frame check; use update() for the debounced,
+        noise-tolerant version used in the main control loop.
+        """
+        self._validate(sensors)
+        return not any(sensors)
+
+    def detect_junction(self, sensors: Sequence[bool]) -> JunctionType:
+        """
+        Classify the current sensor reading into a single JunctionType.
+        Checked in priority order: cross > left > right > dead end > none.
+        Cross takes priority because a left+right pattern also partially
+        satisfies the left/right conditions individually.
+        """
+        self._validate(sensors)
+        if self.detect_cross(sensors):
+            return JunctionType.CROSS
+        if self.detect_left(sensors):
+            return JunctionType.LEFT
+        if self.detect_right(sensors):
+            return JunctionType.RIGHT
+        if self.detect_dead_end(sensors):
+            return JunctionType.DEAD_END
+        return JunctionType.NONE
+
+    # ------------------------------------------------------------------
+    # Debounced stateful update (call once per control-loop tick)
+    # ------------------------------------------------------------------
+
+    def update(self, sensors: Sequence[bool]) -> JunctionType:
+        """
+        Runs detect_junction() but debounces DEAD_END so a single noisy
+        all-off frame (e.g. crossing a gap) doesn't trigger a false
+        dead-end. Non-dead-end results are returned immediately and
+        reset the debounce streak.
+        """
+        result = self.detect_junction(sensors)
+
+        if result == JunctionType.DEAD_END:
+            self._dead_end_streak += 1
+            if self._dead_end_streak >= self.config.dead_end_debounce:
+                return JunctionType.DEAD_END
+            return JunctionType.NONE
+
+        self._dead_end_streak = 0
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _validate(self, sensors: Sequence[bool]) -> None:
+        if len(sensors) != self.num_sensors:
+            raise ValueError(
+                f"Expected {self.num_sensors} sensor readings, got {len(sensors)}"
+            )
+
+
+# ----------------------------------------------------------------------
+# Example usage (manual test, not run automatically by firmware)
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    detector = JunctionDetector(num_sensors=5)
+
+    samples: List[List[bool]] = [
+        [False, False, True, False, False],   # straight line -> NONE
+        [True, True, False, False, False],    # left branch   -> LEFT
+        [False, False, False, True, True],    # right branch  -> RIGHT
+        [True, True, True, True, True],       # cross/T       -> CROSS
+        [False, False, False, False, False],  # dead end      -> NONE (1st frame, debounced)
+        [False, False, False, False, False],  # dead end      -> NONE (2nd frame)
+        [False, False, False, False, False],  # dead end      -> DEAD_END (3rd frame, debounce=3)
+    ]
+
+    for reading in samples:
+        print(reading, "->", detector.update(reading).value)

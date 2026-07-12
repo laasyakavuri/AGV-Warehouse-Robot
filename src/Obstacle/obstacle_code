@@ -1,0 +1,130 @@
+"""
+ObstacleGuard.py
+
+Decision layer that sits between UltrasonicSensor (raw distance readings)
+and the robot's motor controller. It classifies the current distance into
+one of three zones and issues the corresponding command:
+
+    distance > slow_zone_cm            -> resume_robot()   (full speed)
+    stop_zone_cm < distance <= slow_zone_cm  -> slow_down_robot()
+    distance <= stop_zone_cm           -> stop_robot()
+
+The motor controller itself is injected as a dependency (motor_controller)
+so this module has no hardware knowledge of motors/PWM — it only calls
+whatever interface is handed to it. This keeps ObstacleGuard testable and
+decoupled from the drivetrain implementation.
+"""
+
+import logging
+import time
+
+from .UltrasonicSensor import UltrasonicSensor
+
+logger = logging.getLogger("ObstacleGuard")
+
+
+class ObstacleGuard:
+    def __init__(self, motor_controller, trigger_pin, echo_pin,
+                 stop_zone_cm=15.0, slow_zone_cm=40.0,
+                 slow_speed_ratio=0.4, poll_interval=0.1):
+        """
+        motor_controller : object exposing set_speed_ratio(float) and stop()
+        trigger_pin/echo_pin : GPIO pins wired to the ultrasonic sensor
+        stop_zone_cm     : distance at/below which the robot must halt
+        slow_zone_cm     : distance below which the robot should slow down
+        slow_speed_ratio : fraction of normal speed used in the slow zone
+        poll_interval    : seconds between distance checks in run()
+        """
+        if stop_zone_cm >= slow_zone_cm:
+            raise ValueError("stop_zone_cm must be smaller than slow_zone_cm")
+
+        self.motor_controller = motor_controller
+        self.sensor = UltrasonicSensor(trigger_pin, echo_pin)
+
+        self.stop_zone_cm = stop_zone_cm
+        self.slow_zone_cm = slow_zone_cm
+        self.slow_speed_ratio = slow_speed_ratio
+        self.poll_interval = poll_interval
+
+        self._state = "RUNNING"  # RUNNING | SLOWED | STOPPED
+        self._running = False
+
+    # ------------------------------------------------------------------
+    # Core detection
+    # ------------------------------------------------------------------
+
+    def measure_distance(self):
+        """Convenience passthrough to the underlying sensor."""
+        return self.sensor.measure_distance()
+
+    def is_obstacle_detected(self, distance_cm=None):
+        """
+        Returns True if an obstacle is within the stop zone.
+        If distance_cm isn't provided, takes a fresh measurement.
+        """
+        if distance_cm is None:
+            distance_cm = self.measure_distance()
+        return distance_cm <= self.stop_zone_cm
+
+    # ------------------------------------------------------------------
+    # Robot commands
+    # ------------------------------------------------------------------
+
+    def slow_down_robot(self):
+        """Reduce speed but keep moving — used in the caution zone."""
+        if self._state != "SLOWED":
+            logger.warning("Obstacle in caution zone -> slowing down")
+            self.motor_controller.set_speed_ratio(self.slow_speed_ratio)
+            self._state = "SLOWED"
+
+    def stop_robot(self):
+        """Immediately halt all motion — used in the stop zone."""
+        if self._state != "STOPPED":
+            logger.error("Obstacle in stop zone -> stopping robot")
+            self.motor_controller.stop()
+            self._state = "STOPPED"
+
+    def resume_robot(self):
+        """Return to full speed once the path is clear."""
+        if self._state != "RUNNING":
+            logger.info("Path clear -> resuming full speed")
+            self.motor_controller.set_speed_ratio(1.0)
+            self._state = "RUNNING"
+
+    # ------------------------------------------------------------------
+    # Evaluation / control loop
+    # ------------------------------------------------------------------
+
+    def evaluate(self):
+        """
+        Takes one measurement and applies the appropriate command.
+        Returns the distance that was measured, for logging/telemetry.
+        """
+        distance = self.measure_distance()
+
+        if distance <= self.stop_zone_cm:
+            self.stop_robot()
+        elif distance <= self.slow_zone_cm:
+            self.slow_down_robot()
+        else:
+            self.resume_robot()
+
+        return distance
+
+    def run(self):
+        """Blocking loop: continuously monitor and react. Call stop_loop() to end."""
+        self._running = True
+        try:
+            while self._running:
+                self.evaluate()
+                time.sleep(self.poll_interval)
+        finally:
+            self.sensor.close()
+
+    def stop_loop(self):
+        """Signal run() to exit gracefully."""
+        self._running = False
+
+    @property
+    def state(self):
+        return self._state

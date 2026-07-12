@@ -1,0 +1,236 @@
+"""
+NavigationController.py
+
+Top-level navigation orchestrator for the warehouse robot's MainController
+firmware. Ties together four subsystems that already live in this package:
+
+    WarehouseGraph   - static map of nodes (junctions/shelves) and edges (paths)
+    AStar            - astar_search(graph, start, goal) -> List[node_id]
+    LineFollower     - low-level PID line following + physical turn execution
+    JunctionDetector - reads the sensor array and classifies the junction
+                       actually present on the floor right now
+
+This file implements ONLY the NavigationController class. It assumes the
+following interfaces from sibling modules (already present in this package):
+
+    WarehouseGraph:
+        get_position(node_id)      -> (x, y)
+        get_neighbors(node_id)     -> List[node_id]
+        block_edge(a, b)           -> None
+        unblock_edge(a, b)         -> None
+
+    AStar:
+        astar_search(graph, start, goal) -> List[node_id] | None
+
+    LineFollower:
+        follow_until_junction()    -> blocks until a junction line pattern
+                                       is detected, then centers the robot
+                                       on the junction
+        execute_turn(action)       -> physically turns/drives the robot
+                                       for the given TurnAction and resumes
+                                       line following on the new heading
+        stop()                     -> halts motors
+
+    JunctionDetector:
+        detect()                   -> JunctionInfo, exposing
+                                       .available_exits: Set[TurnAction]
+                                       .junction_type: JunctionType
+"""
+
+import logging
+import math
+from enum import Enum
+from typing import List, Optional, Tuple
+
+from .WarehouseGraph import WarehouseGraph
+from .AStar import astar_search
+from .LineFollower import LineFollower
+from .JunctionDetector import JunctionDetector
+
+logger = logging.getLogger("NavigationController")
+
+
+class Heading(Enum):
+    """Absolute compass heading of the robot chassis on the warehouse grid."""
+    NORTH = 0
+    EAST = 90
+    SOUTH = 180
+    WEST = 270
+
+
+class TurnAction(Enum):
+    """Action the robot must take at a junction, relative to its own nose."""
+    STRAIGHT = "STRAIGHT"
+    LEFT = "LEFT"
+    RIGHT = "RIGHT"
+    REVERSE = "REVERSE"  # U-turn, used for dead ends / blocked paths
+
+
+class NavigationController:
+    """
+    Owns the robot's current position in the warehouse graph and drives it,
+    node by node, along an A*-planned path -- re-deciding its turn at every
+    physical junction rather than blindly trusting the plan.
+    """
+
+    MAX_REPLANS = 3  # safety limit to avoid infinite replan loops
+
+    def __init__(
+        self,
+        graph: WarehouseGraph,
+        line_follower: LineFollower,
+        junction_detector: JunctionDetector,
+        start_node: str,
+        start_heading: Heading = Heading.NORTH,
+    ):
+        self.graph = graph
+        self.line_follower = line_follower
+        self.junction_detector = junction_detector
+
+        self.current_node: str = start_node
+        self.heading: Heading = start_heading
+        self.planned_path: List[str] = []
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+
+    def navigate(self, goal_node: str) -> bool:
+        """
+        High-level entry point: plan a path from the current node to
+        goal_node using A*, then drive it. Returns True if the goal was
+        reached, False if no path exists or all replan attempts failed.
+        """
+        path = astar_search(self.graph, self.current_node, goal_node)
+        if not path:
+            logger.error("No path found from %s to %s", self.current_node, goal_node)
+            return False
+
+        logger.info("Planned path: %s", " -> ".join(path))
+        self.planned_path = path
+        return self.execute_path(path, goal_node)
+
+    def execute_path(self, path: List[str], goal_node: str, replans_used: int = 0) -> bool:
+        """
+        Drives the robot along `path` one edge at a time. At every junction,
+        take_decision() is consulted to translate the planned next node into
+        a physical turn, cross-checked against what the JunctionDetector
+        actually sees on the floor. If the plan and reality disagree (e.g. an
+        unexpected obstacle blocks the intended exit), the edge is marked
+        blocked and the path is replanned from the robot's current position.
+        """
+        i = 0
+        while i < len(path) - 1:
+            next_node = path[i + 1]
+
+            # 1. Drive the straight segment until the physical junction is reached.
+            self.line_follower.follow_until_junction()
+
+            # 2. Read what's actually on the floor.
+            junction_info = self.junction_detector.detect()
+
+            # 3. Decide what to do given the plan + reality.
+            action = self.take_decision(self.current_node, next_node, junction_info)
+
+            if action is None:
+                # Planned exit isn't physically available -> replan.
+                logger.warning(
+                    "Exit from %s to %s not available at junction (type=%s). Replanning.",
+                    self.current_node, next_node, junction_info.junction_type,
+                )
+                self.graph.block_edge(self.current_node, next_node)
+
+                if replans_used >= self.MAX_REPLANS:
+                    logger.error("Max replans (%d) exceeded. Aborting navigation.", self.MAX_REPLANS)
+                    self.line_follower.stop()
+                    return False
+
+                new_path = astar_search(self.graph, self.current_node, goal_node)
+                if not new_path:
+                    logger.error("Replan failed: no alternative path to %s", goal_node)
+                    self.line_follower.stop()
+                    return False
+
+                self.planned_path = new_path
+                return self.execute_path(new_path, goal_node, replans_used + 1)
+
+            # 4. Physically execute the turn and update internal state.
+            self.line_follower.execute_turn(action)
+            self.heading = self._apply_turn(self.heading, action)
+            self.current_node = next_node
+            i += 1
+
+            logger.info(
+                "Arrived at %s, heading %s (%d/%d)",
+                self.current_node, self.heading.name, i, len(path) - 1,
+            )
+
+        # Final node: settle the robot precisely on the goal marker.
+        self.line_follower.stop()
+        logger.info("Reached goal node %s", goal_node)
+        return True
+
+    def take_decision(
+        self,
+        current_node: str,
+        next_node: str,
+        junction_info,
+    ) -> Optional[TurnAction]:
+        """
+        Decides which physical action to take at the current junction.
+
+        Compares the geometric direction required to reach `next_node`
+        (derived from the warehouse graph's coordinates and the robot's
+        current heading) against the set of exits the JunctionDetector
+        confirms are physically present at this junction.
+
+        Returns the TurnAction to execute, or None if the planned exit is
+        not physically available (signals the caller to replan).
+        """
+        target_heading = self._heading_to(current_node, next_node)
+        action = self._turn_for_heading_change(self.heading, target_heading)
+
+        if action not in junction_info.available_exits:
+            return None
+        return action
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _heading_to(self, from_node: str, to_node: str) -> Heading:
+        """Absolute compass heading required to travel from_node -> to_node."""
+        (x1, y1) = self.graph.get_position(from_node)
+        (x2, y2) = self.graph.get_position(to_node)
+        dx, dy = x2 - x1, y2 - y1
+
+        # Warehouse grid is axis-aligned: exactly one of dx/dy is non-zero.
+        if abs(dx) >= abs(dy):
+            return Heading.EAST if dx > 0 else Heading.WEST
+        else:
+            return Heading.NORTH if dy > 0 else Heading.SOUTH
+
+    @staticmethod
+    def _turn_for_heading_change(current: Heading, target: Heading) -> TurnAction:
+        """Relative turn action needed to rotate from `current` to `target`."""
+        delta = (target.value - current.value) % 360
+        if delta == 0:
+            return TurnAction.STRAIGHT
+        elif delta == 90:
+            return TurnAction.RIGHT
+        elif delta == 270:
+            return TurnAction.LEFT
+        else:  # delta == 180
+            return TurnAction.REVERSE
+
+    @staticmethod
+    def _apply_turn(current: Heading, action: TurnAction) -> Heading:
+        """New absolute heading after physically executing `action`."""
+        delta = {
+            TurnAction.STRAIGHT: 0,
+            TurnAction.RIGHT: 90,
+            TurnAction.REVERSE: 180,
+            TurnAction.LEFT: 270,
+        }[action]
+        new_value = (current.value + delta) % 360
+        return Heading(new_value)

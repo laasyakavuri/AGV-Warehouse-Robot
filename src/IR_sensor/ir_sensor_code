@@ -1,0 +1,226 @@
+"""
+IRArraySensor.py
+
+Driver for an 8-Channel IR Sensor Array used for line-following.
+
+Hardware assumption:
+    - 8x analog IR reflectance sensors (e.g. QTR-8A style module)
+    - Sensors are wired into an MCP3008 8-channel SPI ADC
+      (channels 0-7 map 1:1 to sensors 0-7, left-to-right)
+    - MCP3008 connected to the controller's SPI bus (spidev)
+
+If your array is digital-only (each sensor outputs a simple HIGH/LOW),
+swap out `_read_adc_channel()` for a GPIO digital read and the rest of
+the module (position math, pattern generation, calibration) works
+unmodified, since it is written against normalized 0.0-1.0 values.
+
+Dependencies:
+    pip install spidev
+"""
+
+import time
+
+try:
+    import spidev
+    _SPI_AVAILABLE = True
+except ImportError:
+    _SPI_AVAILABLE = False
+
+
+class IRArraySensor:
+    NUM_SENSORS = 8
+
+    def __init__(self, spi_bus=0, spi_device=0, spi_max_speed_hz=1000000,
+                 line_is_dark=True, detect_threshold=0.3):
+        """
+        Args:
+            spi_bus / spi_device: SPI bus/device index for the MCP3008.
+            spi_max_speed_hz: SPI clock speed.
+            line_is_dark: True if the line is darker than the surface
+                (dark line on light floor). Set False for a light line
+                on a dark floor.
+            detect_threshold: normalized (0.0-1.0) threshold above which
+                a sensor is considered "on the line".
+        """
+        self.line_is_dark = line_is_dark
+        self.detect_threshold = detect_threshold
+
+        # Per-sensor calibration bounds, populated by calibrate().
+        # Defaults assume a raw 10-bit ADC range (0-1023).
+        self._min_values = [0] * self.NUM_SENSORS
+        self._max_values = [1023] * self.NUM_SENSORS
+        self._calibrated = False
+
+        self.spi = None
+        if _SPI_AVAILABLE:
+            self.spi = spidev.SpiDev()
+            self.spi.open(spi_bus, spi_device)
+            self.spi.max_speed_hz = spi_max_speed_hz
+
+    # ------------------------------------------------------------------
+    # Low-level ADC access
+    # ------------------------------------------------------------------
+    def _read_adc_channel(self, channel):
+        """
+        Read a single MCP3008 channel (0-7) and return a raw 10-bit
+        value (0-1023). Falls back to a mid-scale dummy value if no
+        SPI hardware is available (useful for dry-run / unit testing).
+        """
+        if not (0 <= channel < self.NUM_SENSORS):
+            raise ValueError("channel must be 0-7")
+
+        if self.spi is None:
+            return 512  # neutral dummy reading when hardware is absent
+
+        # MCP3008 read protocol: send start bit, single-ended mode bit,
+        # and the 3-bit channel address, then read back 10 data bits.
+        cmd = [1, (8 + channel) << 4, 0]
+        reply = self.spi.xfer2(cmd)
+        raw = ((reply[1] & 3) << 8) | reply[2]
+        return raw
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def read_ir(self):
+        """
+        Read all 8 sensors and return normalized values (0.0-1.0),
+        where 1.0 = strongest "line" reading and 0.0 = strongest
+        "background/floor" reading, after applying calibration bounds
+        (if calibrate() has been run) and orientation (line_is_dark).
+
+        Returns:
+            list[float]: length-8 list of normalized sensor readings.
+        """
+        readings = []
+        for ch in range(self.NUM_SENSORS):
+            raw = self._read_adc_channel(ch)
+
+            lo = self._min_values[ch]
+            hi = self._max_values[ch]
+            span = max(hi - lo, 1)  # avoid divide-by-zero
+            normalized = (raw - lo) / span
+            normalized = min(max(normalized, 0.0), 1.0)  # clamp 0-1
+
+            if not self.line_is_dark:
+                # If the line is lighter than the floor, invert so that
+                # "1.0" always means "line detected" regardless of
+                # physical contrast direction.
+                normalized = 1.0 - normalized
+
+            readings.append(normalized)
+
+        return readings
+
+    def read_position(self):
+        """
+        Compute the line's position under the array using a weighted
+        average, similar to Pololu QTR sensor libraries.
+
+        Sensors are indexed 0 (leftmost) to 7 (rightmost) and assigned
+        weights 0, 1000, 2000, ... 7000. The result is a weighted
+        average of these weights by sensor intensity, so:
+            0    -> line under sensor 0 (far left)
+            3500 -> line centered under the array
+            7000 -> line under sensor 7 (far right)
+
+        Returns:
+            float | None: position in the 0-7000 range, or None if no
+            sensor currently detects the line (nothing to average).
+        """
+        values = self.read_ir()
+
+        weighted_sum = 0.0
+        total = 0.0
+        for i, v in enumerate(values):
+            weight = i * 1000
+            weighted_sum += weight * v
+            total += v
+
+        if total < 1e-6:
+            return None  # line lost, no signal to compute a position from
+
+        return weighted_sum / total
+
+    def is_line_detected(self):
+        """
+        Returns:
+            bool: True if at least one sensor currently reads above
+            the detection threshold (i.e. the line is under the array).
+        """
+        return any(v >= self.detect_threshold for v in self.read_ir())
+
+    def get_sensor_pattern(self):
+        """
+        Returns:
+            list[int]: length-8 binary pattern, one bit per sensor.
+            1 = line detected under that sensor, 0 = background/floor.
+            Index 0 is the leftmost sensor, index 7 the rightmost.
+
+            Example: [0, 0, 1, 1, 0, 0, 0, 0] means the line is
+            currently under sensors 2 and 3 (center-left).
+        """
+        return [1 if v >= self.detect_threshold else 0 for v in self.read_ir()]
+
+    def calibrate(self, duration_sec=3.0, sample_interval_sec=0.02):
+        """
+        Runs a calibration sweep. Physically move/rotate the robot so
+        the sensor array passes back and forth over the line during
+        this call, so each sensor sees both its darkest and lightest
+        extremes.
+
+        Records the min and max raw ADC value seen per sensor over the
+        sampling window; these bounds are then used by read_ir() to
+        normalize future readings to a consistent 0.0-1.0 scale
+        regardless of ambient lighting or sensor-to-sensor variance.
+
+        Args:
+            duration_sec: total time to sample for.
+            sample_interval_sec: delay between samples.
+        """
+        mins = [1023] * self.NUM_SENSORS
+        maxs = [0] * self.NUM_SENSORS
+
+        elapsed = 0.0
+        while elapsed < duration_sec:
+            for ch in range(self.NUM_SENSORS):
+                raw = self._read_adc_channel(ch)
+                if raw < mins[ch]:
+                    mins[ch] = raw
+                if raw > maxs[ch]:
+                    maxs[ch] = raw
+            time.sleep(sample_interval_sec)
+            elapsed += sample_interval_sec
+
+        # Guard against sensors that never saw meaningful variation
+        # (e.g. stuck sensor, no line passed under it) by keeping a
+        # minimum span.
+        for ch in range(self.NUM_SENSORS):
+            if maxs[ch] - mins[ch] < 20:
+                maxs[ch] = mins[ch] + 20
+
+        self._min_values = mins
+        self._max_values = maxs
+        self._calibrated = True
+
+    def close(self):
+        """Release the SPI handle."""
+        if self.spi is not None:
+            self.spi.close()
+
+
+if __name__ == "__main__":
+    sensor = IRArraySensor()
+    print("Calibrating... sweep the array across the line now.")
+    sensor.calibrate(duration_sec=3.0)
+    print("Calibration done.")
+
+    try:
+        while True:
+            pattern = sensor.get_sensor_pattern()
+            pos = sensor.read_position()
+            detected = sensor.is_line_detected()
+            print(f"pattern={pattern} position={pos} detected={detected}")
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        sensor.close()

@@ -1,0 +1,90 @@
+"""
+NotificationService.py
+Sends push notifications via Firebase Cloud Messaging (FCM), reusing
+plain HTTPS requests so it works on MicroPython without extra SDKs.
+"""
+
+import urequests as requests
+
+
+class NotificationService:
+    def __init__(self, fcm_project_id=None, access_token_provider=None,
+                 fcm_server_key=None):
+        """
+        fcm_project_id:        Firebase project ID, used for the modern
+                                FCM HTTP v1 API.
+        access_token_provider: callable returning a fresh OAuth2 bearer
+                                token for FCM v1 (v1 requires a short-lived
+                                token, normally minted by a service-account
+                                helper rather than stored on-device).
+        fcm_server_key:        legacy FCM server key, used only as a
+                                fallback if v1 credentials aren't supplied.
+        """
+        self.fcm_project_id = fcm_project_id
+        self.access_token_provider = access_token_provider
+        self.fcm_server_key = fcm_server_key
+
+    def send_notification(self, title, body, topic="maincontroller", data=None):
+        """
+        Sends a push notification to a topic (all devices subscribed to it).
+        Prefers the modern HTTP v1 API; falls back to the legacy API if v1
+        credentials are missing; logs locally if neither is configured.
+        """
+        if self.fcm_project_id and self.access_token_provider:
+            return self._send_v1(title, body, topic, data)
+        elif self.fcm_server_key:
+            return self._send_legacy(title, body, topic, data)
+        else:
+            print("[NotificationService] No FCM credentials configured. "
+                  "Notification not sent: '{}' - '{}'".format(title, body))
+            return False
+
+    def _send_v1(self, title, body, topic, data):
+        url = "https://fcm.googleapis.com/v1/projects/{}/messages:send".format(
+            self.fcm_project_id)
+        token = self.access_token_provider()
+        headers = {
+            "Authorization": "Bearer {}".format(token),
+            "Content-Type": "application/json",
+        }
+        message = {
+            "message": {
+                "topic": topic,
+                "notification": {"title": title, "body": body},
+            }
+        }
+        if data:
+            message["message"]["data"] = data
+
+        try:
+            resp = requests.post(url, json=message, headers=headers)
+            ok = resp.status_code == 200
+            resp.close()
+            print("[NotificationService] send_notification (v1) -> {}".format(ok))
+            return ok
+        except Exception as e:
+            print("[NotificationService] v1 send error: {}".format(e))
+            return False
+
+    def _send_legacy(self, title, body, topic, data):
+        url = "https://fcm.googleapis.com/fcm/send"
+        headers = {
+            "Authorization": "key={}".format(self.fcm_server_key),
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "to": "/topics/{}".format(topic),
+            "notification": {"title": title, "body": body},
+        }
+        if data:
+            payload["data"] = data
+
+        try:
+            resp = requests.post(url, json=payload, headers=headers)
+            ok = resp.status_code == 200
+            resp.close()
+            print("[NotificationService] send_notification (legacy) -> {}".format(ok))
+            return ok
+        except Exception as e:
+            print("[NotificationService] legacy send error: {}".format(e))
+            return False

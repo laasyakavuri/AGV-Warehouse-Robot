@@ -1,0 +1,270 @@
+"""
+WarehouseGraph.py
+
+Warehouse navigation graph module.
+
+Represents the warehouse floor as a graph of nodes (waypoints, shelves,
+charging stations, docks, etc.) connected by edges (traversable paths).
+Internally uses an adjacency list representation for fast neighbor lookup,
+which is well suited for the graph-search algorithms (A*, Dijkstra, BFS)
+typically used for path planning on an embedded main controller.
+
+Expected data files (JSON), default locations relative to this module:
+
+    nodes.json
+    [
+        {"id": "N01", "x": 0.0, "y": 0.0, "z": 0.0, "type": "waypoint"},
+        {"id": "N02", "x": 1.5, "y": 0.0, "z": 0.0, "type": "shelf"},
+        ...
+    ]
+
+    edges.json
+    [
+        {"from": "N01", "to": "N02", "bidirectional": true, "weight": null},
+        ...
+    ]
+
+If "weight" is null/omitted, the Euclidean distance between the two nodes
+is computed automatically via calculate_distance().
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+
+DEFAULT_NODES_PATH = os.path.join(os.path.dirname(__file__), "nodes.json")
+DEFAULT_EDGES_PATH = os.path.join(os.path.dirname(__file__), "edges.json")
+
+
+@dataclass
+class Node:
+    """A single point in the warehouse (waypoint, shelf, dock, etc.)."""
+    id: str
+    x: float
+    y: float
+    z: float = 0.0
+    type: str = "waypoint"
+    meta: dict = field(default_factory=dict)
+
+    def coords(self) -> Tuple[float, float, float]:
+        return (self.x, self.y, self.z)
+
+
+@dataclass
+class Edge:
+    """A traversable connection between two nodes."""
+    to: str
+    weight: float
+
+
+class WarehouseGraphError(Exception):
+    """Raised for malformed graph data or invalid graph operations."""
+
+
+class WarehouseGraph:
+    """
+    Adjacency-list graph of the warehouse layout.
+
+    Attributes:
+        nodes: Dict mapping node_id -> Node
+        adjacency: Dict mapping node_id -> List[Edge] (the adjacency list)
+    """
+
+    def __init__(self) -> None:
+        self.nodes: Dict[str, Node] = {}
+        self.adjacency: Dict[str, List[Edge]] = {}
+
+    # ------------------------------------------------------------------ #
+    # Loading
+    # ------------------------------------------------------------------ #
+
+    def load_nodes(self, path: str = DEFAULT_NODES_PATH) -> Dict[str, Node]:
+        """
+        Load node definitions from a JSON file and populate self.nodes.
+
+        Args:
+            path: Path to the nodes JSON file.
+
+        Returns:
+            The populated nodes dictionary (node_id -> Node).
+
+        Raises:
+            WarehouseGraphError: if the file is missing or malformed.
+        """
+        if not os.path.isfile(path):
+            raise WarehouseGraphError(f"Node file not found: {path}")
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw_nodes = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise WarehouseGraphError(f"Invalid JSON in node file {path}: {exc}") from exc
+
+        nodes: Dict[str, Node] = {}
+        for entry in raw_nodes:
+            try:
+                node_id = str(entry["id"])
+                node = Node(
+                    id=node_id,
+                    x=float(entry["x"]),
+                    y=float(entry["y"]),
+                    z=float(entry.get("z", 0.0)),
+                    type=str(entry.get("type", "waypoint")),
+                    meta=entry.get("meta", {}),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise WarehouseGraphError(f"Malformed node entry {entry!r}: {exc}") from exc
+
+            if node_id in nodes:
+                raise WarehouseGraphError(f"Duplicate node id: {node_id}")
+
+            nodes[node_id] = node
+            self.adjacency.setdefault(node_id, [])
+
+        self.nodes = nodes
+        return self.nodes
+
+    def load_edges(self, path: str = DEFAULT_EDGES_PATH) -> Dict[str, List[Edge]]:
+        """
+        Load edge definitions from a JSON file and build the adjacency list.
+
+        Nodes must already be loaded via load_nodes() before calling this,
+        since edge weights may be derived from node coordinates.
+
+        Args:
+            path: Path to the edges JSON file.
+
+        Returns:
+            The populated adjacency dictionary (node_id -> List[Edge]).
+
+        Raises:
+            WarehouseGraphError: if the file is missing/malformed, or an
+                edge references an unknown node.
+        """
+        if not self.nodes:
+            raise WarehouseGraphError("load_nodes() must be called before load_edges()")
+
+        if not os.path.isfile(path):
+            raise WarehouseGraphError(f"Edge file not found: {path}")
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw_edges = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise WarehouseGraphError(f"Invalid JSON in edge file {path}: {exc}") from exc
+
+        # Reset adjacency lists (keep an entry for every known node).
+        self.adjacency = {node_id: [] for node_id in self.nodes}
+
+        for entry in raw_edges:
+            try:
+                src = str(entry["from"])
+                dst = str(entry["to"])
+                bidirectional = bool(entry.get("bidirectional", True))
+                explicit_weight = entry.get("weight", None)
+            except (KeyError, TypeError) as exc:
+                raise WarehouseGraphError(f"Malformed edge entry {entry!r}: {exc}") from exc
+
+            if src not in self.nodes or dst not in self.nodes:
+                raise WarehouseGraphError(
+                    f"Edge references unknown node(s): {src} -> {dst}"
+                )
+
+            weight = (
+                float(explicit_weight)
+                if explicit_weight is not None
+                else self.calculate_distance(src, dst)
+            )
+
+            self.adjacency[src].append(Edge(to=dst, weight=weight))
+            if bidirectional:
+                self.adjacency[dst].append(Edge(to=src, weight=weight))
+
+        return self.adjacency
+
+    # ------------------------------------------------------------------ #
+    # Queries
+    # ------------------------------------------------------------------ #
+
+    def get_neighbors(self, node_id: str) -> List[Tuple[str, float]]:
+        """
+        Get the neighbors of a node from the adjacency list.
+
+        Args:
+            node_id: The id of the node to query.
+
+        Returns:
+            A list of (neighbor_node_id, edge_weight) tuples.
+
+        Raises:
+            WarehouseGraphError: if node_id is not present in the graph.
+        """
+        if node_id not in self.nodes:
+            raise WarehouseGraphError(f"Unknown node id: {node_id}")
+
+        return [(edge.to, edge.weight) for edge in self.adjacency.get(node_id, [])]
+
+    def calculate_distance(self, node_a_id: str, node_b_id: str) -> float:
+        """
+        Calculate the straight-line (Euclidean) distance between two nodes,
+        based on their stored coordinates. Used both for automatic edge
+        weighting and as a heuristic for path-planning algorithms.
+
+        Args:
+            node_a_id: Id of the first node.
+            node_b_id: Id of the second node.
+
+        Returns:
+            Euclidean distance between the two nodes.
+
+        Raises:
+            WarehouseGraphError: if either node id is unknown.
+        """
+        a = self.nodes.get(node_a_id)
+        b = self.nodes.get(node_b_id)
+        if a is None:
+            raise WarehouseGraphError(f"Unknown node id: {node_a_id}")
+        if b is None:
+            raise WarehouseGraphError(f"Unknown node id: {node_b_id}")
+
+        return math.dist(a.coords(), b.coords())
+
+    # ------------------------------------------------------------------ #
+    # Convenience helpers
+    # ------------------------------------------------------------------ #
+
+    def get_node(self, node_id: str) -> Optional[Node]:
+        """Return the Node object for node_id, or None if not found."""
+        return self.nodes.get(node_id)
+
+    def node_count(self) -> int:
+        return len(self.nodes)
+
+    def edge_count(self) -> int:
+        """Total number of directed edges stored in the adjacency list."""
+        return sum(len(edges) for edges in self.adjacency.values())
+
+    def __repr__(self) -> str:
+        return (
+            f"WarehouseGraph(nodes={self.node_count()}, "
+            f"edges={self.edge_count()})"
+        )
+
+
+if __name__ == "__main__":
+    # Minimal manual smoke test when run directly.
+    graph = WarehouseGraph()
+    try:
+        graph.load_nodes()
+        graph.load_edges()
+        print(graph)
+        first_id = next(iter(graph.nodes), None)
+        if first_id:
+            print(f"Neighbors of {first_id}: {graph.get_neighbors(first_id)}")
+    except WarehouseGraphError as e:
+        print(f"WarehouseGraph error: {e}")

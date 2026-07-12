@@ -1,0 +1,214 @@
+"""
+AStarPlanner.py
+
+A* path planning module for MainController navigation.
+
+The planner operates on a 2D occupancy grid, where each cell is either
+free (traversable) or blocked (an obstacle). Given a start and goal
+cell, it returns the shortest sequence of grid cells connecting them,
+or None if no path exists.
+
+Grid convention:
+    - grid[row][col] == 0  -> free cell
+    - grid[row][col] != 0  -> obstacle
+    - Coordinates are (row, col) tuples.
+"""
+
+import heapq
+import math
+
+
+class AStarPlanner:
+    """
+    Encapsulates the A* search over a static 2D grid.
+
+    Usage:
+        planner = AStarPlanner(grid, allow_diagonal=True)
+        path = planner.find_shortest_path(start, goal)
+    """
+
+    # 8-connected neighborhood: 4 straight moves + 4 diagonal moves.
+    # Each entry is (delta_row, delta_col, step_cost).
+    _STRAIGHT_MOVES = [
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+    ]
+    _DIAGONAL_MOVES = [
+        (-1, -1, math.sqrt(2)),
+        (-1, 1, math.sqrt(2)),
+        (1, -1, math.sqrt(2)),
+        (1, 1, math.sqrt(2)),
+    ]
+
+    def __init__(self, grid, allow_diagonal=True):
+        """
+        grid: 2D list (rows x cols) where 0 = free, non-zero = obstacle.
+        allow_diagonal: if True, search considers 8-connected movement;
+                         otherwise only 4-connected (up/down/left/right).
+        """
+        self.grid = grid
+        self.num_rows = len(grid)
+        self.num_cols = len(grid[0]) if self.num_rows > 0 else 0
+        self.moves = self._STRAIGHT_MOVES + (
+            self._DIAGONAL_MOVES if allow_diagonal else []
+        )
+
+    # ------------------------------------------------------------------
+    # Heuristic
+    # ------------------------------------------------------------------
+    def heuristic(self, node, goal):
+        """
+        Estimate the remaining cost from `node` to `goal`.
+
+        We use Euclidean distance. It is admissible (never overestimates
+        the true cost) for both 4-connected and 8-connected grids because
+        the straight-line distance is always <= the true shortest path
+        distance on a grid. This guarantees A* returns an optimal path.
+
+        node, goal: (row, col) tuples.
+        """
+        row1, col1 = node
+        row2, col2 = goal
+        return math.sqrt((row1 - row2) ** 2 + (col1 - col2) ** 2)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _in_bounds(self, node):
+        row, col = node
+        return 0 <= row < self.num_rows and 0 <= col < self.num_cols
+
+    def _is_walkable(self, node):
+        row, col = node
+        return self.grid[row][col] == 0
+
+    def _get_neighbors(self, node):
+        """
+        Yield (neighbor, step_cost) pairs for all valid, walkable
+        neighboring cells of `node`.
+        """
+        row, col = node
+        for d_row, d_col, cost in self.moves:
+            neighbor = (row + d_row, col + d_col)
+            if self._in_bounds(neighbor) and self._is_walkable(neighbor):
+                yield neighbor, cost
+
+    # ------------------------------------------------------------------
+    # Path reconstruction
+    # ------------------------------------------------------------------
+    def reconstruct_path(self, came_from, current):
+        """
+        Walk backwards through the `came_from` map (child -> parent)
+        starting at `current` (the goal), until we reach a node with
+        no recorded parent (the start node). Then reverse the result
+        so the path reads start -> ... -> goal.
+        """
+        path = [current]
+        while current in came_from:
+            current = came_from[current]
+            path.append(current)
+        path.reverse()
+        return path
+
+    # ------------------------------------------------------------------
+    # Main A* search
+    # ------------------------------------------------------------------
+    def find_shortest_path(self, start, goal):
+        """
+        Run A* search from `start` to `goal`.
+
+        Returns a list of (row, col) tuples describing the shortest
+        path from start to goal (inclusive), or None if unreachable.
+
+        Algorithm outline:
+        1. Maintain an open set (priority queue) of nodes to explore,
+           ordered by f_score = g_score + heuristic.
+             - g_score(n): best known cost from start to n.
+             - heuristic(n, goal): estimated cost from n to goal.
+        2. Maintain a `came_from` map recording, for each visited node,
+           which neighbor led to the best known path reaching it.
+        3. Repeatedly pop the node with the lowest f_score.
+             - If it is the goal, reconstruct and return the path.
+             - Otherwise, relax each of its neighbors: if reaching a
+               neighbor through the current node is cheaper than any
+               previously known route, record the new cost/parent and
+               push the neighbor onto the open set.
+        4. If the open set empties without reaching the goal, no path
+           exists -> return None.
+        """
+        if not self._in_bounds(start) or not self._in_bounds(goal):
+            return None
+        if not self._is_walkable(start) or not self._is_walkable(goal):
+            return None
+
+        # g_score[node] = cost of the cheapest known path from start to node.
+        g_score = {start: 0.0}
+
+        # came_from[node] = the predecessor node on the cheapest known
+        # path from start to node. Used later by reconstruct_path().
+        came_from = {}
+
+        # Open set as a min-heap of (f_score, tie_breaker, node).
+        # tie_breaker (a monotonically increasing counter) avoids
+        # comparing node tuples directly when f_scores are equal.
+        open_heap = []
+        counter = 0
+        start_f_score = self.heuristic(start, goal)
+        heapq.heappush(open_heap, (start_f_score, counter, start))
+
+        # Track nodes currently sitting in the heap that are still
+        # "the best known way in" — lets us skip stale heap entries.
+        open_set = {start}
+
+        while open_heap:
+            _, _, current = heapq.heappop(open_heap)
+
+            if current not in open_set:
+                # Stale entry: a cheaper route to this node was already
+                # processed. Skip it.
+                continue
+            open_set.discard(current)
+
+            # Goal reached: walk back through came_from to build the path.
+            if current == goal:
+                return self.reconstruct_path(came_from, current)
+
+            for neighbor, step_cost in self._get_neighbors(current):
+                tentative_g = g_score[current] + step_cost
+
+                # If this path to neighbor is better than any previous
+                # one, record it and (re)queue the neighbor.
+                if tentative_g < g_score.get(neighbor, math.inf):
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    f_score = tentative_g + self.heuristic(neighbor, goal)
+                    counter += 1
+                    heapq.heappush(open_heap, (f_score, counter, neighbor))
+                    open_set.add(neighbor)
+
+        # Open set exhausted without finding the goal -> no valid path.
+        return None
+
+
+if __name__ == "__main__":
+    # Minimal self-test / usage example.
+    # 0 = free, 1 = obstacle
+    sample_grid = [
+        [0, 0, 0, 0, 0],
+        [0, 1, 1, 1, 0],
+        [0, 0, 0, 1, 0],
+        [1, 1, 0, 1, 0],
+        [0, 0, 0, 0, 0],
+    ]
+
+    planner = AStarPlanner(sample_grid, allow_diagonal=False)
+    result_path = planner.find_shortest_path((0, 0), (4, 4))
+
+    if result_path:
+        print("Path found:")
+        for step in result_path:
+            print(f"  {step}")
+    else:
+        print("No path found.")

@@ -1,0 +1,88 @@
+"""
+NotificationService.py
+Sends notifications related to device/delivery events.
+
+Uses Firebase Cloud Messaging (FCM legacy HTTP API) for push notifications,
+and mirrors every notification into Firebase RTDB (via FirebaseClient) so
+a companion app can show in-app history even without push enabled.
+"""
+
+import time
+import json
+
+try:
+    import urequests as requests
+except ImportError:
+    import requests
+
+FCM_SEND_URL = "https://fcm.googleapis.com/fcm/send"
+
+
+class NotificationService:
+    def __init__(self, firebase_client, fcm_server_key=None, default_topic="all_devices"):
+        """
+        firebase_client: an initialized FirebaseClient instance (reused for RTDB writes)
+        fcm_server_key:  legacy FCM server key, used for push notifications (optional)
+        default_topic:   FCM topic to publish to when no specific device token is given
+        """
+        self.firebase_client = firebase_client
+        self.fcm_server_key = fcm_server_key
+        self.default_topic = default_topic
+
+    def _log_to_rtdb(self, title, message, level):
+        path = "devices/{}/notifications".format(self.firebase_client.device_id)
+        payload = {
+            "title": title,
+            "message": message,
+            "level": level,
+            "timestamp": time.time(),
+        }
+        return self.firebase_client._post(path, payload)
+
+    def _send_fcm_push(self, title, message, target_token=None):
+        if not self.fcm_server_key:
+            print("[NotificationService] No FCM server key configured, skipping push")
+            return False
+
+        headers = {
+            "Authorization": "key={}".format(self.fcm_server_key),
+            "Content-Type": "application/json",
+        }
+        body = {
+            "notification": {"title": title, "body": message},
+        }
+        if target_token:
+            body["to"] = target_token
+        else:
+            body["to"] = "/topics/{}".format(self.default_topic)
+
+        try:
+            response = requests.post(FCM_SEND_URL, data=json.dumps(body), headers=headers)
+            ok = response.status_code == 200
+            response.close()
+            return ok
+        except Exception as e:
+            print("[NotificationService] FCM push error:", e)
+            return False
+
+    def send_notification(self, title, message, level="info", target_token=None, push=True):
+        """
+        Sends a notification.
+        - Always logs to Firebase RTDB under devices/<id>/notifications for history.
+        - Optionally sends a push notification via FCM if push=True and a
+          server key is configured.
+
+        level:        "info" | "warning" | "error"
+        target_token: specific device's FCM registration token, or None to
+                       broadcast to `default_topic`
+        push:         set False to log only, without triggering a push
+        """
+        logged = self._log_to_rtdb(title, message, level)
+
+        pushed = False
+        if push:
+            pushed = self._send_fcm_push(title, message, target_token)
+
+        print("[NotificationService] send_notification: '{}' logged={} pushed={}".format(
+            title, logged, pushed))
+        return logged or pushed
